@@ -1,0 +1,171 @@
+name: Build and Release Protols
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    strategy:
+      matrix:
+        os: [macos-15-large, macos-15-xlarge, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.22
+
+      - name: Decode and import the certificate
+        if: ${{ matrix.os == 'macos-15-large' || matrix.os == 'macos-15-xlarge' }}
+        run: |
+          # Decode the base64-encoded certificate and save it as a .p12 file
+          echo "${{ secrets.CERTIFICATE_P12_BASE64 }}" | base64 --decode > certificate.p12
+          
+          # Import the .p12 certificate into the macOS keychain
+          security create-keychain -p "temp-password" build.keychain
+          security import certificate.p12 -k build.keychain -P "${{ secrets.CERTIFICATE_PASSWORD }}" -T /usr/bin/codesign
+          
+          # Set the keychain as default and unlock it
+          security list-keychains -s build.keychain
+          security unlock-keychain -p "temp-password" build.keychain
+          
+          # Set keychain settings to prevent it from locking automatically
+          security set-keychain-settings build.keychain
+          
+          # Pre-authorize codesign to access the certificate
+          security set-key-partition-list -S apple-tool:,apple: -s -k "temp-password" build.keychain
+
+          echo "SIGN_IDENTITY=${{ secrets.SIGN_IDENTITY }}" >> $GITHUB_ENV
+          echo "APPLE_ID=${{ secrets.APPLE_ID }}" >> $GITHUB_ENV
+          echo "APPLE_APP_SPECIFIC_PASSWORD=${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" >> $GITHUB_ENV
+          echo "APPLE_TEAM_ID=${{ secrets.APPLE_TEAM_ID }}" >> $GITHUB_ENV
+
+      - name: Build Protols
+        id: build_protols
+        run: |
+          mkdir -p release
+          GOBIN=$PWD/release go install ./cmd/protols
+          if [ "${{ matrix.os }}" == "macos-15-xlarge" ]; then
+            echo "ARCH=arm64" >> $GITHUB_OUTPUT
+            echo "FILENAME=protols-darwin-arm64.zip" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.os }}" == "macos-15-large" ]; then
+            echo "ARCH=amd64" >> $GITHUB_OUTPUT
+            echo "FILENAME=protols-darwin-amd64.zip" >> $GITHUB_OUTPUT
+          else
+            echo "ARCH=amd64" >> $GITHUB_OUTPUT
+            echo "FILENAME=protols-linux-amd64.zip" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare Release Assets
+        run: |
+          if [[ "${{ matrix.os }}" == "macos-15-large" || "${{ matrix.os }}" == "macos-15-xlarge" ]]; then
+            # Function to codesign a binary
+            sign_binary() {
+                local binary_path="$1"
+                codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$binary_path"
+            }
+            sign_binary release/protols
+          fi
+          zip -j release/${{ steps.build_protols.outputs.FILENAME }} release/protols
+
+      - name: Notarize and Staple
+        if: ${{ matrix.os == 'macos-15-large' || matrix.os == 'macos-15-xlarge' }}
+        run: |
+          # Function to sign, notarize, and staple
+          notarize_and_staple() {
+              local package_path="$1"
+
+              # Unlock the keychain
+              security unlock-keychain -p "$KEYCHAIN_PASSWD" ~/Library/Keychains/login.keychain
+
+              # Submit for notarization
+              STATUS=$(xcrun notarytool submit "$package_path" \
+                                        --team-id "$APPLE_TEAM_ID" \
+                                        --apple-id "$APPLE_ID" \
+                                        --password "$APPLE_APP_SPECIFIC_PASSWORD" 2>&1)
+
+              # Get the submission ID
+              SUBMISSION_ID=$(echo "$STATUS" | awk -F ': ' '/id:/ { print $2; exit; }')
+              echo "Notarization submission ID: $SUBMISSION_ID"
+
+              # Wait for notarization to complete
+              xcrun notarytool wait "$SUBMISSION_ID" \
+                                    --team-id "$APPLE_TEAM_ID" \
+                                    --apple-id "$APPLE_ID" \
+                                    --password "$APPLE_APP_SPECIFIC_PASSWORD"
+
+              # Check the notarization status
+              REQUEST_STATUS=$(xcrun notarytool info "$SUBMISSION_ID" \
+                              --team-id "$APPLE_TEAM_ID" \
+                              --apple-id "$APPLE_ID" \
+                              --password "$APPLE_APP_SPECIFIC_PASSWORD" 2>&1 | \
+                              awk -F ': ' '/status:/ { print $2; }')
+
+              if [[ "$REQUEST_STATUS" != "Accepted" ]]; then
+                  echo "Notarization failed."
+                  exit 1
+              fi
+          }
+
+          # **Step 3: Notarize the Zip Archive**
+          notarize_and_staple "release/${{ steps.build_protols.outputs.FILENAME }}"
+
+
+      - name: Calculate SHA256 Checksums
+        id: calculate_sha256
+        run: |
+          cd release
+          echo "SHA256SUMS=$(shasum -a 256 ${{ steps.build_protols.outputs.FILENAME }} | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Get date
+        id: get_date
+        run: |
+          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+
+      - name: Delete Existing Release
+        if: always()
+        run: |
+          tag="v${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.ARCH }}"
+          release_id=$(gh release view "$tag" --json id -q '.id' 2>/dev/null || echo "")
+          if [[ -n "$release_id" ]]; then
+            gh release delete "$tag" -y
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "v${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.ARCH }}"
+          release_name: "${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.ARCH }}"
+          draft: false
+          prerelease: false
+          body: |
+            SHA256 Checksums:
+            ```
+            ${{ steps.calculate_sha256.outputs.SHA256SUMS }}
+            ```
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: release/${{ steps.build_protols.outputs.FILENAME }}
+          asset_name: ${{ steps.build_protols.outputs.FILENAME }}
+          asset_content_type: application/zip
+
