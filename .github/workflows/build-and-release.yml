@@ -57,12 +57,15 @@ jobs:
           GOBIN=$PWD/release go install ./cmd/protols
           if [ "${{ matrix.os }}" == "macos-15-xlarge" ]; then
             echo "ARCH=arm64" >> $GITHUB_OUTPUT
+            echo "FULLNAME=protols-darwin-arm64" >> $GITHUB_OUTPUT
             echo "FILENAME=protols-darwin-arm64.zip" >> $GITHUB_OUTPUT
           elif [ "${{ matrix.os }}" == "macos-15-large" ]; then
             echo "ARCH=amd64" >> $GITHUB_OUTPUT
+            echo "FULLNAME=protols-darwin-amd64" >> $GITHUB_OUTPUT
             echo "FILENAME=protols-darwin-amd64.zip" >> $GITHUB_OUTPUT
           else
             echo "ARCH=amd64" >> $GITHUB_OUTPUT
+            echo "FULLNAME=protols-linux-amd64" >> $GITHUB_OUTPUT
             echo "FILENAME=protols-linux-amd64.zip" >> $GITHUB_OUTPUT
           fi
 
@@ -135,7 +138,7 @@ jobs:
       - name: Delete Existing Release
         if: always()
         run: |
-          tag="v${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.ARCH }}"
+          tag="v${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.FULLNAME }}"
           release_id=$(gh release view "$tag" --json id -q '.id' 2>/dev/null || echo "")
           if [[ -n "$release_id" ]]; then
             gh release delete "$tag" -y
@@ -149,8 +152,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: "v${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.ARCH }}"
-          release_name: "${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.ARCH }}"
+          tag_name: "v${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.FULLNAME }}"
+          release_name: "${{ steps.get_date.outputs.DATE }}-${{ steps.build_protols.outputs.FULLNAME }}"
           draft: false
           prerelease: false
           body: |
